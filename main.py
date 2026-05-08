@@ -373,5 +373,59 @@ class GsCodePlugin(Star):
             async for resp in self._handle_code(event, game_key):
                 yield resp
 
+    # ─── Regex Auto-Trigger (group chat) ─────────────────────────────────
+
+    @filter.regex(r"原神.{0,5}兑换码|原神.{0,3}前瞻.{0,3}码")
+    async def auto_genshin(self, event: AstrMessageEvent):
+        """群聊自动识别：原神兑换码"""
+        async for resp in self._handle_code(event, "gs"):
+            yield resp
+
+    @filter.regex(r"(崩铁|星穹铁道|星铁|铁道).{0,5}兑换码|(崩铁|星穹铁道|星铁).{0,3}前瞻.{0,3}码")
+    async def auto_hsr(self, event: AstrMessageEvent):
+        """群聊自动识别：崩铁兑换码"""
+        async for resp in self._handle_code(event, "sr"):
+            yield resp
+
+    @filter.regex(r"绝区零.{0,5}兑换码|绝区零.{0,3}前瞻.{0,3}码|zzz.{0,5}(code|兑换码)")
+    async def auto_zzz(self, event: AstrMessageEvent):
+        """群聊自动识别：绝区零兑换码"""
+        async for resp in self._handle_code(event, "zzz"):
+            yield resp
+
+    @filter.regex(r"(?<!\w)(有.{0,3}兑换码|兑换码.{0,5}(查|有|给|发|来|求|要|在哪|怎么|有没有))")
+    async def auto_all(self, event: AstrMessageEvent):
+        """群聊自动识别：有兑换码吗 / 兑换码怎么查"""
+        for game_key in GAMES:
+            async for resp in self._handle_code(event, game_key):
+                yield resp
+
+    # ─── LLM Tool Registration ───────────────────────────────────────────
+
+    @filter.llm_tool("get_genshin_code")
+    async def tool_genshin(self, event: AstrMessageEvent):
+        """获取原神最新前瞻直播兑换码。当用户询问原神兑换码、原神前瞻直播码时调用。"""
+        async for resp in self._handle_code(event, "gs"):
+            yield resp
+
+    @filter.llm_tool("get_hsr_code")
+    async def tool_hsr(self, event: AstrMessageEvent):
+        """获取崩坏：星穹铁道最新前瞻直播兑换码。当用户询问崩铁/星铁/星穹铁道兑换码时调用。"""
+        async for resp in self._handle_code(event, "sr"):
+            yield resp
+
+    @filter.llm_tool("get_zzz_code")
+    async def tool_zzz(self, event: AstrMessageEvent):
+        """获取绝区零最新前瞻直播兑换码。当用户询问绝区零/ZZZ兑换码时调用。"""
+        async for resp in self._handle_code(event, "zzz"):
+            yield resp
+
+    @filter.llm_tool("get_all_codes")
+    async def tool_all(self, event: AstrMessageEvent):
+        """获取所有米哈游游戏（原神/崩铁/绝区零）的最新前瞻直播兑换码。"""
+        for game_key in GAMES:
+            async for resp in self._handle_code(event, game_key):
+                yield resp
+
     async def terminate(self):
         await self.client.aclose()
