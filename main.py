@@ -1,6 +1,9 @@
+import hashlib
 import json
 import re
 import time
+import uuid
+import urllib.parse
 from datetime import datetime, timezone, timedelta
 
 import httpx
@@ -14,205 +17,334 @@ HEADERS = {
                   "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
 }
 
+BILI_HEADERS = {
+    **HEADERS,
+    "Referer": "https://www.bilibili.com",
+}
+
 # Game configurations
 GAMES = {
     "gs": {
-        "uid": 75276550,
-        "keywords": ["版本前瞻特别节目"],
+        "uid": 75276539,
+        "keywords": ["版本前瞻特别节目", "前瞻"],
         "name": "原神",
-        "biz": "hk4e",
-        "cmds": ["gicode", "原神兑换码"],
+        "search_kw": "原神兑换码",
     },
     "sr": {
         "uid": 80823548,
         "keywords": ["版本前瞻讨论活动", "版本前瞻特别节目"],
         "name": "崩坏：星穹铁道",
-        "biz": "hkrpg",
-        "cmds": ["hsrcode", "崩铁兑换码"],
+        "search_kw": "崩坏星穹铁道兑换码",
     },
     "zzz": {
-        "uid": 152039072,
+        "uid": 152039148,
         "keywords": ["版本前瞻特别节目", "版本前瞻"],
         "name": "绝区零",
-        "biz": "nap",
-        "cmds": ["zzzcode", "绝区零兑换码"],
+        "search_kw": "绝区零兑换码",
     },
 }
+
+MIXIN_KEY_ENC_TAB = [
+    46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
+    27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13,
+    37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4,
+    22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
+]
+
+# Code parsing patterns
+CODE_ALPHA = re.compile(r"\b[A-Z0-9]{10,16}\b")
+CODE_CN = re.compile(r"^[一-鿿㐀-䶿]{4,15}$")
+SECTION_HEADER = re.compile(
+    r"^([\d一二三四五六七八九十]+[.、．\s]*第[一二三四五六七八九十\d]+[组个]|"
+    r"第[一二三四五六七八九十\d]+[组个]|兑换码|CODE|code|激活码|礼包码|"
+    r"版本信息|版本前瞻|上半|下半|前瞻直播|直播兑换|前瞻兑换|"
+    r"以上.*信息|信息汇总|总结|注意|PS|ps|截止|"
+    r"卡池信息|月之七前瞻|"
+    r"以上.*码|兑换码.*信息|前瞻.*信息)"
+)
+
+
+def _parse_codes_from_text(text: str) -> list:
+    codes = []
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
+    for i, line in enumerate(lines):
+        if SECTION_HEADER.match(line) or len(line) < 2:
+            continue
+        code = None
+        title = ""
+        alpha_match = CODE_ALPHA.search(line)
+        if alpha_match:
+            code = alpha_match.group()
+            for j in range(max(0, i - 3), i):
+                if CODE_CN.match(lines[j].strip()) and not SECTION_HEADER.match(lines[j].strip()):
+                    title = lines[j].strip()
+                    break
+        elif CODE_CN.match(line) and not SECTION_HEADER.match(line):
+            code = line
+            for j in range(max(0, i - 3), i):
+                c = lines[j].strip()
+                if re.match(r"^[\d一二三四五六七八九十]+[.、．\s]*第[一二三四五六七八九十\d]+[组个]", c):
+                    title = c
+                    break
+                elif re.match(r"^第[一二三四五六七八九十\d]+[组个]", c):
+                    title = c
+                    break
+        if code:
+            codes.append({"title": title, "code": code})
+    seen = {}
+    for item in codes:
+        if item["code"] not in seen:
+            seen[item["code"]] = item
+    return list(seen.values())
 
 
 @register(
     "astrbot_plugin_gscode",
     "yxm11",
     "获取米哈游游戏（原神/星穹铁道/绝区零）前瞻直播兑换码",
-    "1.0.0",
+    "1.1.0",
 )
 class GsCodePlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
         self.client = httpx.AsyncClient(timeout=15)
+        self.wbi_img_key = ""
+        self.wbi_sub_key = ""
+        self._bili_initialized = False
 
-    # ─── miHoYo API Pipeline ─────────────────────────────────────────────
+    # ─── Bilibili Session Init ────────────────────────────────────────────
+
+    async def _init_bilibili(self):
+        if self._bili_initialized:
+            return
+        buvid3 = str(uuid.uuid4()) + "infoc"
+        self.client.cookies.set("buvid3", buvid3, domain=".bilibili.com")
+        self.client.cookies.set("b_nut", str(int(time.time())), domain=".bilibili.com")
+        try:
+            resp = await self.client.get("https://api.bilibili.com/x/frontend/finger/spi", headers=BILI_HEADERS)
+            spi = resp.json()
+            if spi.get("code") == 0:
+                if spi["data"].get("b_3"):
+                    self.client.cookies.set("buvid3", spi["data"]["b_3"], domain=".bilibili.com")
+                if spi["data"].get("b_4"):
+                    self.client.cookies.set("buvid4", spi["data"]["b_4"], domain=".bilibili.com")
+        except Exception:
+            pass
+        try:
+            resp = await self.client.get("https://api.bilibili.com/x/web-interface/nav", headers=BILI_HEADERS)
+            nav = resp.json()["data"]
+            self.wbi_img_key = nav["wbi_img"]["img_url"].rsplit("/", 1)[1].split(".")[0]
+            self.wbi_sub_key = nav["wbi_img"]["sub_url"].rsplit("/", 1)[1].split(".")[0]
+        except Exception:
+            pass
+        self._bili_initialized = True
+
+    def _sign_wbi(self, params: dict) -> dict:
+        mixin_key = "".join((self.wbi_img_key + self.wbi_sub_key)[i] for i in MIXIN_KEY_ENC_TAB)[:32]
+        params["wts"] = int(time.time())
+        params = dict(sorted(params.items()))
+        params_str = urllib.parse.urlencode(
+            {k: "".join(c for c in str(v) if c.isascii()) for k, v in params.items()}
+        )
+        params["w_rid"] = hashlib.md5((params_str + mixin_key).encode()).hexdigest()
+        return params
+
+    # ─── miyolive API (Primary) ──────────────────────────────────────────
 
     async def _get_act_id(self, game_key: str) -> str:
-        """Discover livestream act_id from official miyoushe posts."""
         config = GAMES[game_key]
-        url = (
-            f"https://bbs-api.mihoyo.com/painter/api/user_instant/list"
-            f"?offset=0&size=20&uid={config['uid']}"
-        )
+        url = f"https://bbs-api.mihoyo.com/painter/api/user_instant/list?offset=0&size=20&uid={config['uid']}"
         resp = await self.client.get(url, headers=HEADERS)
         data = resp.json()
         if data.get("retcode") != 0:
             return ""
-
-        act_id = ""
         for item in data["data"]["list"]:
             post = item.get("post", {}).get("post", {})
             if not post:
                 continue
-            subject = post.get("subject", "")
-            if not any(kw in subject for kw in config["keywords"]):
+            if not any(kw in post.get("subject", "") for kw in config["keywords"]):
                 continue
-
             sc = post.get("structured_content", "")
             if not sc:
                 continue
             try:
-                segments = json.loads(sc)
-                for seg in segments:
+                for seg in json.loads(sc):
                     link = seg.get("attributes", {}).get("link", "")
                     if "act_id=" in link:
                         match = re.findall(r"act_id=(.*?)&", link)
                         if match:
-                            act_id = match[0]
-                            break
+                            return match[0]
             except (json.JSONDecodeError, KeyError):
                 pass
-            if act_id:
-                break
-        return act_id
+        return ""
 
-    async def _get_live_data(self, act_id: str) -> dict:
-        """Fetch livestream metadata from miyolive API."""
-        resp = await self.client.get(
-            "https://api-takumi.mihoyo.com/event/miyolive/index",
-            headers={**HEADERS, "x-rpc-act_id": act_id},
-        )
-        data = resp.json()
-        if data.get("retcode") != 0:
-            return {
-                "error": data.get("message", "Unknown error"),
-                "retcode": data.get("retcode"),
-            }
-
-        live = data["data"]["live"]
-        template = json.loads(data["data"].get("template", "{}"))
-
-        result = {
-            "code_ver": live.get("code_ver", ""),
-            "title": live.get("title", "").replace("特别节目", ""),
-            "is_end": live.get("is_end", False),
-            "start": live.get("start", ""),
-            "header": template.get("kvDesktop", ""),
-            "room": template.get("liveConfig", [{}])[0].get("desktop", ""),
-        }
-
-        if live.get("is_end"):
-            review = template.get("reviewUrl", "")
-            if isinstance(review, dict):
-                review = review.get("args", {}).get("post_id", "")
-            result["review"] = review
-        else:
-            now = datetime.now(TZ)
-            start_str = live.get("start", "")
-            if start_str:
-                try:
-                    start_dt = datetime.strptime(start_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
-                    if now < start_dt:
-                        result["not_started"] = True
-                except ValueError:
-                    pass
-        return result
-
-    async def _get_codes(self, version: str, act_id: str) -> list:
-        """Fetch redemption codes from refreshCode API."""
-        resp = await self.client.get(
-            "https://api-takumi-static.mihoyo.com/event/miyolive/refreshCode",
-            params={"version": version, "time": str(int(time.time()))},
-            headers={**HEADERS, "x-rpc-act_id": act_id},
-        )
-        data = resp.json()
-        if data.get("retcode") != 0:
-            return []
-        codes = []
-        for item in data["data"].get("code_list", []):
-            title = re.sub(r"<.*?>", "", item["title"].replace("&nbsp;", " "))
-            codes.append({"title": title, "code": item["code"]})
-        return codes
-
-    # ─── Command Handler ─────────────────────────────────────────────────
-
-    async def _handle_code(self, event: AstrMessageEvent, game_key: str):
-        """Shared handler for all game code commands."""
+    async def _get_codes_from_miyolive(self, game_key: str) -> dict:
         config = GAMES[game_key]
-
-        # Step 1: Find act_id
         try:
             act_id = await self._get_act_id(game_key)
-        except Exception as e:
-            yield event.plain_result(f"获取活动信息失败：{e}")
-            return
-
+        except Exception:
+            return {"status": "error"}
         if not act_id:
-            yield event.plain_result(f"暂无{config['name']}前瞻直播资讯！")
-            return
+            return {"status": "no_act_id"}
 
-        # Step 2: Get live data
         try:
-            live = await self._get_live_data(act_id)
-        except Exception as e:
-            yield event.plain_result(f"获取直播数据失败：{e}")
-            return
+            resp = await self.client.get(
+                "https://api-takumi.mihoyo.com/event/miyolive/index",
+                headers={**HEADERS, "x-rpc-act_id": act_id},
+            )
+            data = resp.json()
+        except Exception:
+            return {"status": "error"}
 
-        if live.get("error"):
-            retcode = live.get("retcode", "")
-            if retcode == -500007:
-                yield event.plain_result(f"{config['name']}前瞻直播活动已结束，兑换码可能已过期。")
-            else:
-                yield event.plain_result(f"直播数据异常：{live['error']}")
-            return
+        if data.get("retcode") != 0:
+            return {"status": "ended"}
 
-        title = live.get("title", config["name"])
+        live = data["data"]["live"]
+        ver = live.get("code_ver", "")
+        title = live.get("title", "").replace("特别节目", "")
 
-        # Not started yet
-        if live.get("not_started"):
-            msg = f"📺 {title}\n\n直播尚未开始\n预计开播：{live.get('start', '未知')}"
-            if live.get("header"):
-                yield event.image_result(live["header"])
-            yield event.plain_result(msg)
-            return
-
-        # Step 3: Fetch codes
+        # Try to fetch codes regardless of is_end status
         try:
-            codes = await self._get_codes(live["code_ver"], act_id)
-        except Exception as e:
-            yield event.plain_result(f"获取兑换码失败：{e}")
+            resp2 = await self.client.get(
+                "https://api-takumi-static.mihoyo.com/event/miyolive/refreshCode",
+                params={"version": ver, "time": str(int(time.time()))},
+                headers={**HEADERS, "x-rpc-act_id": act_id},
+            )
+            data2 = resp2.json()
+            if data2.get("retcode") == 0:
+                codes = []
+                for item in data2["data"].get("code_list", []):
+                    t = re.sub(r"<.*?>", "", item["title"].replace("&nbsp;", " "))
+                    codes.append({"title": t, "code": item["code"]})
+                if codes:
+                    return {"status": "ok", "codes": codes, "title": title}
+        except Exception:
+            pass
+        return {"status": "ended"}
+
+    # ─── Bilibili Fallback ────────────────────────────────────────────────
+
+    async def _get_codes_from_bilibili(self, game_key: str) -> dict:
+        config = GAMES[game_key]
+        await self._init_bilibili()
+
+        if not self.wbi_img_key:
+            return {"status": "error", "codes": []}
+
+        params = self._sign_wbi({
+            "search_type": "video",
+            "keyword": config["search_kw"],
+            "order": "pubdate",
+            "page": 1,
+        })
+        try:
+            resp = await self.client.get(
+                "https://api.bilibili.com/x/web-interface/wbi/search/type",
+                params=params, headers=BILI_HEADERS,
+            )
+            videos = resp.json().get("data", {}).get("result", [])[:3]
+        except Exception:
+            return {"status": "error", "codes": []}
+
+        if not videos:
+            return {"status": "no_videos", "codes": []}
+
+        all_codes = []
+        source_title = ""
+        for video in videos:
+            bvid = video.get("bvid", "")
+            title = video.get("title", "").replace('<em class="keyword">', "").replace("</em>", "")
+
+            try:
+                resp2 = await self.client.get(
+                    "https://api.bilibili.com/x/web-interface/view",
+                    params={"bvid": bvid}, headers=BILI_HEADERS,
+                )
+                aid = resp2.json()["data"]["aid"]
+            except Exception:
+                continue
+
+            for pn in range(1, 4):
+                try:
+                    resp3 = await self.client.get(
+                        "https://api.bilibili.com/x/v2/reply",
+                        params={"type": 1, "oid": aid, "sort": 2, "pn": pn, "ps": 20},
+                        headers=BILI_HEADERS,
+                    )
+                    d3 = resp3.json()
+                    if d3.get("code") != 0:
+                        break
+                    replies = d3.get("data", {}).get("replies")
+                    if not replies:
+                        break
+                    for r in replies:
+                        content = r["content"]["message"]
+                        codes = _parse_codes_from_text(content)
+                        if codes:
+                            all_codes.extend(codes)
+                            if not source_title:
+                                source_title = title
+                except Exception:
+                    break
+                await self._sleep(0.3)
+
+            await self._sleep(0.5)
+
+        seen = {}
+        for item in all_codes:
+            if item["code"] not in seen:
+                seen[item["code"]] = item
+        return {"status": "ok" if seen else "no_codes", "codes": list(seen.values()), "title": source_title}
+
+    @staticmethod
+    async def _sleep(seconds: float):
+        import asyncio
+        await asyncio.sleep(seconds)
+
+    # ─── Main Handler ────────────────────────────────────────────────────
+
+    async def _handle_code(self, event: AstrMessageEvent, game_key: str):
+        config = GAMES[game_key]
+
+        # Primary: miyolive
+        miyolive = await self._get_codes_from_miyolive(game_key)
+        if miyolive["status"] == "ok":
+            codes = miyolive["codes"]
+            title = miyolive.get("title", config["name"])
+            lines = [f"🎮 {config['name']}兑换码查询结果"]
+            lines.append(f"来源：{title}")
+            lines.append(f"共找到 {len(codes)} 个兑换码，请在有效期内及时兑换：\n")
+            for c in codes:
+                t = f"【{c['title']}】" if c["title"] else ""
+                lines.append(f"{t}\n{c['code']}\n")
+            lines.append("* 兑换码有效期有限，请尽快使用")
+            yield event.plain_result("\n".join(lines))
             return
 
-        if not codes:
-            yield event.plain_result(f"暂未发布{config['name']}兑换码，请稍后再试。\n* 官方接口有约2分钟延迟")
+        # Fallback: Bilibili
+        bili = await self._get_codes_from_bilibili(game_key)
+        if bili["status"] == "ok":
+            codes = bili["codes"]
+            title = bili.get("title", "")
+            lines = [f"🎮 {config['name']}兑换码查询结果"]
+            if title:
+                lines.append(f"来源：{title}")
+            lines.append(f"共找到 {len(codes)} 个兑换码，请在有效期内及时兑换：\n")
+            for c in codes:
+                t = f"【{c['title']}】" if c["title"] else ""
+                lines.append(f"{t}\n{c['code']}\n")
+            lines.append("* 兑换码有效期有限，请尽快使用")
+            lines.append("\n数据来源：B站评论区")
+            yield event.plain_result("\n".join(lines))
             return
 
-        # Build response
-        lines = [f"🎮 {title}", f"当前发布 {len(codes)} 个兑换码，请在有效期内及时兑换：\n"]
-        for c in codes:
-            lines.append(f"【{c['title']}】\n{c['code']}\n")
-        lines.append("* 兑换码有效期有限，请尽快使用")
-
-        if live.get("review"):
-            lines.append(f"\n📺 直播回放：https://www.miyoushe.com/ys/article/{live['review']}")
-
-        yield event.plain_result("\n".join(lines))
+        # Nothing found
+        yield event.plain_result(
+            f"🎮 {config['name']}兑换码查询结果\n"
+            f"❌ 暂无前瞻直播资讯\n\n"
+            f"当前没有正在进行的{config['name']}前瞻直播。\n"
+            f"新版本前瞻通常在版本更新前1-2周举行，届时再查询即可。"
+        )
 
     # ─── Register Commands ───────────────────────────────────────────────
 
