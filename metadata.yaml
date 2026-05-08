@@ -1,6 +1,6 @@
 name: astrbot_plugin_gscode
 version: 1.0.0
-author: yxm11
+author: zhiruizz
 description: 获取米哈游游戏（原神/星穹铁道/绝区零）前瞻直播兑换码。通过米游社官方API自动发现直播活动并获取兑换码。
 main: main.py
 license: MIT
