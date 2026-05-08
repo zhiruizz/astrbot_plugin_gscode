@@ -2,7 +2,7 @@
 
 获取米哈游游戏（原神/星穹铁道/绝区零）前瞻直播兑换码。
 
-通过米游社官方API自动发现直播活动并获取兑换码，无需手动输入活动ID。
+通过米游社官方API自动发现直播活动并获取兑换码，无需手动输入活动ID。idea来源于https://github.com/monsterxcn/nonebot-plugin-gscode
 
 ## 安装
 
